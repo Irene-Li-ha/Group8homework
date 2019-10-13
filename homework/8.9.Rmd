@@ -1,0 +1,223 @@
+---
+title: "Capm Beta"
+runtime: shiny
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    source_code: embed
+---
+
+
+```{r setup, message = FALSE}
+library(tidyverse)
+library(highcharter)
+library(tidyquant)
+library(timetk)
+library(scales)
+library(broom)
+library(highcharter)
+library(DBI)
+library(RMySQL)
+#加载需要的包
+```
+
+Sidebar {.sidebar}
+=====================================
+  
+```{r}
+#建立侧栏并允许用户输入五个股票名称和权重
+fluidRow(
+  column(6,
+  textInput("stock1", "Stock 1","600000")),#创建长度为6的列，输入数据定义变量名为stock1，文本框名为Stock1，文本输入，默认值为SPY
+  column(5,
+  numericInput("w1", "Portf. %", 25, min = 1, max = 100))#创建长度为5的列，输入数据定义变量名为w1，文本框名为Stock1,数值输入，最小为1最大为100.默认值为25
+)  
+# 重复五次
+fluidRow(
+  column(6,
+  textInput("stock2", "Stock 2", "600004")),
+  column(5,
+  numericInput("w2", "Portf. %", 25, min = 1, max = 100))
+)
+
+fluidRow(
+  column(6,
+  textInput("stock3", "Stock 3", "600006")),
+  column(5,
+  numericInput("w3", "Portf. %", 20, min = 1, max = 100))
+)
+
+fluidRow(
+  column(6,
+  textInput("stock4", "Stock 4", "600007")),
+  column(5,
+  numericInput("w4", "Portf. %", 20, min = 1, max = 100))
+)
+
+fluidRow(
+  column(6,
+  textInput("stock5", "Stock 5", "600015")),
+  column(5,
+  numericInput("w5", "Portf. %", 10, min = 1, max = 100))
+)
+#创建开始日期行
+fluidRow( #创建行
+  column(7,
+  dateInput("date", "Starting Date", "2019-01-01", format = "yyyy-mm-dd"))
+)
+#创建长度为7的列，输入数据定义变量名为data，文本框名为Starting Date,日期输入，默认值为2013-01-01，形式为yyyy-mm-dd
+actionButton("go", "Submit") #提交按钮
+```
+
+
+```{r}
+prices <- eventReactive(input$go, {
+    #等待按钮被点击，得到价格数据
+  symbols <- c(input$stock1, input$stock2, input$stock3, input$stock4, input$stock5)
+  data<-list()
+for (i in 1:5){ 
+  mydb= dbConnect(MySQL(),user='ktruc002', password='35442fed', dbname='cn_stock_quote', host='172.19.3.250') #和本地数据库建立连接
+  SQL_statement<-paste("SELECT  `day`,`close` 
+FROM `cn_stock_quote`.`daily_adjusted_quote`
+WHERE code=",symbols[i],"and day >='",input$date,"'
+ORDER BY 'day' DESC ") #从中国股票的每日调整报价表中以股票代码和开始日期选择获取日期、收盘价收盘价
+  aa <- dbGetQuery(mydb,SQL_statement)
+  colnames(aa)[2]<-paste("x",symbols[i],sep="",collapse="")
+  data[[i]]=aa
+}#用循环构建list，每个参数对应一张数据表
+  stockdata<-data %>%
+  reduce(merge)#合并表格
+  prices<-xts(stockdata[,-1],order.by = as.Date(stockdata[,1]))  #转换为xts数据类型
+})
+
+
+market_return <- eventReactive(input$go, { #等待按钮被点击，得到市场收益率数据
+  
+     mydb= dbConnect(MySQL(),user='ktruc002', password='35442fed', dbname='cn_stock_quote', host='172.19.3.250') 
+  SQL_statement<-paste("SELECT  `trade_date`,`last` 
+FROM `cn_stock_index`.`daily_quote`
+WHERE index_code='000001' and trade_date >='",input$date,"'
+ORDER BY 'trade_date' DESC ")
+  bb <- dbGetQuery(mydb,SQL_statement)
+market_prices<-xts(bb[,-1],order.by = as.Date(bb[,1]))
+colnames(market_prices)<- colnames(bb)[2]<-paste("x","000001",sep="",collapse="")#获取上证综合指数计算市场收益率
+  market_return<-market_prices%>%
+    to.monthly(indexAt = "lastof",    #告诉函数是要索引到每月的第一天还是最后一天，如果想使用第一天，改为indexAt = "firstof"
+             OHLC = FALSE) %>%
+    Return.calculate(.,
+                     method = "log") %>%  #将价格转换成月对数收益率,可以用method="log"得到简单收益率
+    na.omit()  %>%
+    tk_tbl(preserve_index = TRUE,      
+                      rename_index = "date") %>%
+    select(date, returns = x000001) 
+
+})
+
+portfolio_returns_tq_rebalanced_monthly <- eventReactive(input$go, {
+    #返回资产组合调整后的月度收益率
+  prices <- prices()
+  #需要权重之和等于100，不然就报错，提示The portfolio weights must sum to 100%!
+  validate(need(input$w1 + input$w2 +
+                input$w3 + input$w4 +
+                input$w5 == 100,
+                "The portfolio weights must sum to 100%!"))
+   #调用价格函数
+  w <- c(input$w1/100, input$w2/100, input$w3/100, input$w4/100, input$w5/100)
+  #令w定义为输入的权重向量
+  portfolio_returns_tq_rebalanced_monthly <- 
+      prices %>% #输入之前获得的各股票价格
+      to.monthly(indexAt = "lastof", OHLC = FALSE) %>% #转换为月度数据
+      tk_tbl(preserve_index = TRUE, rename_index = "date") %>% #将价格从xts转换为tibble
+      gather(asset, prices, -date) %>% #将宽格式转换为长格式
+      group_by(asset) %>%   #按资产列分组
+      mutate(returns = (log(prices) - log(lag(prices)))) %>%  #返回对数收益率的结果
+      na.omit() %>% #删除空值
+      tq_portfolio(assets_col  = asset,  #资产列
+               returns_col = returns,#收益列
+               weights     = w,#权重
+               col_rename  = "returns",#重命名
+               rebalance_on = "months")#按月重新平衡
+}) #获得投资组合的收益率
+
+
+beta_dplyr_byhand <- eventReactive(input$go, {
+  #计算投资组合的beta值
+  #portfolio_returns_tq_rebalanced_monthly <- portfolio_returns_tq_rebalanced_monthly()
+  #调用获取投资组合的调整后的月度收益率数据函数
+  market_return <- market_return()
+   #调用获取市场收益率的函数
+  #定义beta值的计算方式
+beta_dplyr_byhand <- 
+  portfolio_returns_tq_rebalanced_monthly() %>% 
+  do(model = lm(returns ~ market_return$returns, data = .))#模型选取一元线性回归方程，，自变量市场收益率，因变量投资组合的收益率，计算beta值
+
+})
+  
+  
+portfolio_model_augmented <- eventReactive(input$go, {
+  #生成含预测数据的新数据框
+  portfolio_returns_tq_rebalanced_monthly <- portfolio_returns_tq_rebalanced_monthly()
+  #调用获取投资组合的调整后的月度收益率数据函数
+  beta_dplyr_byhand() %>% #调用计算beta的函数
+  augment(model) %>% #将一元线性回归模型预测的数据增加到原数据中，并存储在名为.fitted的新列
+  rename(mkt_rtns = market_return.returns) %>%  #重命名mkt_rtns
+  select(returns, mkt_rtns, .fitted) %>% #保存收益率，市场收益率，预测收益率列
+  mutate(date = portfolio_returns_tq_rebalanced_monthly$date)#返回索引为投资组合的调整后的月度收益率
+  
+})
+
+
+```
+
+Click submit to calculate the CAPM Beta of your portfolio
+=====================================  
+
+Row {data-height=650}
+-----------------------------------------------------------------------
+
+### CAPM Highcharter
+
+```{r}
+renderHighchart({
+#创建Highchart图
+portfolio_model_augmented <- portfolio_model_augmented()
+#赋值
+highchart() %>% 
+  hc_title(text = "Scatter with Regression Line") %>% 
+  hc_add_series(portfolio_model_augmented,  #增加一组数
+                type = "scatter",#图表类型设置为散点图
+                color = "cornflowerblue",#点的颜色设置
+                hcaes(x = round(mkt_rtns, 4), #x轴为投资组合收益，保留四位小数
+                      y = round(returns, 4),#y轴为市场收益，保留四位小数
+                      date = date), #添加日期值
+                name = "Returns") %>% #名称
+  hc_add_series(portfolio_model_augmented, #添加回归线,添加另一组数
+                type = "line", #图表类型设置为线
+                enableMouseTracking = FALSE,
+                hcaes(x = mkt_rtns, y = .fitted), #x值设置为市场收益,y值设置为拟合值
+                name = "CAPM Beta = Slope of Line") %>% 
+  hc_xAxis(title = list(text = "Market Returns")) %>% #将横坐标标题设置为Market Returns
+  hc_yAxis(title = list(text = "Portfolio Returns")) %>% #将横坐标标题设置为Portfolio Returns
+  hc_tooltip(formatter = JS("function(){
+     return ('port return: ' + this.y + ' <br> mkt return: ' + this.x +  
+     ' <br> date: ' + this.point.date)}"))%>% #创建自定义工具提示功能以获取日期
+  hc_add_theme(hc_theme_flat()) %>% #主题设置为FiveThirtyEight
+  hc_exporting(enabled = TRUE) #设置为可输出，可以保存
+
+
+})
+```
+
+
+Row 2 {data-height=350}
+----------------------------------
+
+### Model Results
+
+```{r}
+renderTable({ #创建表格
+  beta_dplyr_byhand() %>% #返回计算的beta值
+  tidy(model) %>% #清理结果，来自broom包
+  mutate(term = c("alpha", "beta")) #返回alpha和beta两行值
+}, digits = 4)#显示4位小数
+```
